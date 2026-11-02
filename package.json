@@ -1,0 +1,14 @@
+{
+  "name": "rocket-stats",
+  "version": "1.0.0",
+  "description": "Dashboard de statistiques Rocket League via Ballchasing API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
