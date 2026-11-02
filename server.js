@@ -5,6 +5,7 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.BALLCHASING_API_KEY;
+const REPLAY_COUNT = Math.min(Number(process.env.REPLAY_COUNT) || 20, 50);
 
 if (!API_KEY) {
   console.warn('⚠️  BALLCHASING_API_KEY manquante dans .env — le mode réel ne fonctionnera pas. Le mode démo reste disponible.');
@@ -28,8 +29,10 @@ function setCache(key, data) {
   cache.set(key, { data, expires: Date.now() + CACHE_TTL });
 }
 
-// Helper : appel Ballchasing avec la clé côté serveur
-async function ballchasingFetch(endpoint) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Helper : appel Ballchasing avec la clé côté serveur (+ retry sur 429)
+async function ballchasingFetch(endpoint, retries = 3) {
   if (!API_KEY) {
     throw Object.assign(new Error('Clé API absente'), { code: 'NO_KEY' });
   }
@@ -38,10 +41,15 @@ async function ballchasingFetch(endpoint) {
     headers: { Authorization: API_KEY },
   });
 
-  if (res.status === 401) {
+  if (res.status === 401 || res.status === 403) {
     throw Object.assign(new Error('Clé API invalide ou expirée'), { code: 'INVALID_KEY' });
   }
   if (res.status === 429) {
+    if (retries > 0) {
+      // Le compte gratuit est limité à ~2 requêtes/seconde : on attend et on réessaie
+      await sleep(1200 * (4 - retries));
+      return ballchasingFetch(endpoint, retries - 1);
+    }
     throw Object.assign(new Error('Quota Ballchasing dépassé. Réessaie dans quelques minutes.'), { code: 'RATE_LIMIT' });
   }
   if (!res.ok) {
@@ -57,16 +65,38 @@ async function pMapLimit(items, limit, fn) {
   async function worker() {
     while (index < items.length) {
       const i = index++;
-      results[i] = await fn(items[i], i);
+      try {
+        results[i] = await fn(items[i], i);
+      } catch (err) {
+        if (err.code === 'INVALID_KEY' || err.code === 'NO_KEY') throw err;
+        console.warn(`Replay ignoré (${items[i]}) : ${err.message}`);
+        results[i] = null;
+      }
     }
   }
   const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
   await Promise.all(workers);
-  return results;
+  return results.filter(Boolean);
+}
+
+// "steam:7656..." / "epic:abc" / "psynet:..." → recherche par ID de plateforme
+const PLATFORM_RE = /^(steam|epic|ps4|xbox|switch|psynet):(.+)$/i;
+function parsePlayerQuery(input) {
+  const m = input.match(PLATFORM_RE);
+  if (m) return { type: 'id', platform: m[1].toLowerCase(), id: m[2] };
+  return { type: 'name', name: input };
+}
+
+// Buts d'une équipe : Ballchasing les place dans team.stats.core.goals
+function teamGoals(team) {
+  if (!team) return 0;
+  if (typeof team.stats?.core?.goals === 'number') return team.stats.core.goals;
+  if (typeof team.goals === 'number') return team.goals;
+  return (team.players || []).reduce((sum, p) => sum + (p.stats?.core?.goals || 0), 0);
 }
 
 // Agrégation des stats à partir des détails de replays
-function aggregateStats(replayDetails, playerName) {
+function aggregateStats(replayDetails, query) {
   const stats = {
     matches: 0,
     wins: 0,
@@ -76,28 +106,39 @@ function aggregateStats(replayDetails, playerName) {
     saves: 0,
     shots: 0,
     score: 0,
-    boostUsed: 0,          // pas toujours disponible
-    timeAirborne: 0,        // pas toujours disponible
-    playlists: {},          // { "2v2": { wins, losses, goals... } }
-    timeline: [],           // évolution match par match
+    mvps: 0,
+    boostUsed: 0,
+    boostSamples: 0,
+    timeAirborne: 0,
+    airSamples: 0,
+    playlists: {},
+    timeline: [],
+    displayName: null,
+    platform: null,
   };
 
   for (const detail of replayDetails) {
-    // Trouver le joueur dans le replay (blue ou orange)
     const allPlayers = [
-      ...(detail.blue?.players || []).map(p => ({ ...p, team: 'blue', teamGoals: detail.blue.goals })),
-      ...(detail.orange?.players || []).map(p => ({ ...p, team: 'orange', teamGoals: detail.orange.goals })),
+      ...(detail.blue?.players || []).map((p) => ({ ...p, team: 'blue' })),
+      ...(detail.orange?.players || []).map((p) => ({ ...p, team: 'orange' })),
     ];
 
-    const player = allPlayers.find(
-      p => p.name?.toLowerCase() === playerName.toLowerCase() ||
-           p.id?.id === playerName
+    const player = allPlayers.find((p) =>
+      query.type === 'id'
+        ? String(p.id?.id).toLowerCase() === query.id.toLowerCase()
+        : p.name?.toLowerCase() === query.name.toLowerCase()
     );
 
     if (!player) continue;
 
-    const opponentGoals = player.team === 'blue' ? detail.orange?.goals : detail.blue?.goals;
-    const won = (player.teamGoals ?? 0) > (opponentGoals ?? 0);
+    const blueGoals = teamGoals(detail.blue);
+    const orangeGoals = teamGoals(detail.orange);
+    const myGoals = player.team === 'blue' ? blueGoals : orangeGoals;
+    const oppGoals = player.team === 'blue' ? orangeGoals : blueGoals;
+    const won = myGoals > oppGoals;
+
+    stats.displayName = stats.displayName || player.name;
+    stats.platform = stats.platform || player.id?.platform || null;
 
     stats.matches++;
     if (won) stats.wins++; else stats.losses++;
@@ -108,14 +149,20 @@ function aggregateStats(replayDetails, playerName) {
     stats.saves   += core.saves || 0;
     stats.shots   += core.shots || 0;
     stats.score   += core.score || 0;
+    if (core.mvp) stats.mvps++;
 
-    // Champs potentiellement absents
     const boost = player.stats?.boost;
-    if (boost && typeof boost.amount_used === 'number') stats.boostUsed += boost.amount_used;
+    if (boost && typeof boost.amount_collected === 'number') {
+      stats.boostUsed += boost.amount_collected;
+      stats.boostSamples++;
+    }
     const movement = player.stats?.movement;
-    if (movement && typeof movement.time_airborne === 'number') stats.timeAirborne += movement.time_airborne;
+    if (movement && typeof movement.time_high_air === 'number') {
+      stats.timeAirborne += (movement.time_high_air || 0) + (movement.time_low_air || 0);
+      stats.airSamples++;
+    }
 
-    const playlistName = detail.playlist_name || 'Inconnu';
+    const playlistName = detail.playlist_name || detail.playlist_id || 'Inconnu';
     if (!stats.playlists[playlistName]) {
       stats.playlists[playlistName] = { wins: 0, losses: 0, goals: 0, assists: 0, saves: 0, shots: 0, matches: 0 };
     }
@@ -130,22 +177,35 @@ function aggregateStats(replayDetails, playerName) {
     stats.timeline.push({
       date: detail.date,
       playlist: playlistName,
+      map: detail.map_name || detail.map_code || '',
       goals: core.goals || 0,
       assists: core.assists || 0,
       saves: core.saves || 0,
       shots: core.shots || 0,
+      score: core.score || 0,
+      mvp: !!core.mvp,
+      myGoals,
+      oppGoals,
       won,
     });
   }
 
+  // Ordre chronologique (plus ancien → plus récent)
+  stats.timeline.sort((a, b) => new Date(a.date) - new Date(b.date));
+
   // Calculs dérivés
   stats.winRate = stats.matches ? (stats.wins / stats.matches) * 100 : 0;
   stats.shotAccuracy = stats.shots ? (stats.goals / stats.shots) * 100 : 0;
-  stats.avgBoost = stats.matches ? stats.boostUsed / stats.matches : null;
-  stats.avgAirTime = stats.matches ? stats.timeAirborne / stats.matches : null;
+  stats.avgScore = stats.matches ? stats.score / stats.matches : 0;
+  stats.avgBoost = stats.boostSamples ? stats.boostUsed / stats.boostSamples : null;
+  stats.avgAirTime = stats.airSamples ? stats.timeAirborne / stats.airSamples : null;
 
   return stats;
 }
+
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, hasKey: !!API_KEY });
+});
 
 // Endpoint principal
 app.get('/api/stats', async (req, res) => {
@@ -154,7 +214,7 @@ app.get('/api/stats', async (req, res) => {
 
   if (demo) {
     const { getDemoData } = require('./demo-data');
-    return res.json({ demo: true, player: player || 'Demo Player', stats: getDemoData() });
+    return res.json({ demo: true, player: 'Demo Player', stats: getDemoData() });
   }
 
   if (!player) {
@@ -163,35 +223,40 @@ app.get('/api/stats', async (req, res) => {
 
   const cacheKey = `stats:${player.toLowerCase()}`;
   const cached = getCached(cacheKey);
-  if (cached) return res.json({ demo: false, player, stats: cached, cached: true });
+  if (cached) return res.json({ demo: false, player: cached.displayName || player, stats: cached, cached: true });
 
   try {
-    // 1) Lister les replays du joueur (30 max pour rester raisonnable)
-    const listRes = await ballchasingFetch(`/replays?player-name=${encodeURIComponent(player)}&count=30&sort-by=replay-date&sort-dir=desc`);
+    const query = parsePlayerQuery(player);
+    const filter = query.type === 'id'
+      ? `player-id=${encodeURIComponent(`${query.platform}:${query.id}`)}`
+      : `player-name=${encodeURIComponent(query.name)}`;
+
+    // 1) Lister les replays du joueur
+    const listRes = await ballchasingFetch(`/replays?${filter}&count=${REPLAY_COUNT}&sort-by=replay-date&sort-dir=desc`);
     const replayList = listRes.list || [];
 
     if (!replayList.length) {
-      return res.status(404).json({ error: `Aucun replay trouvé pour "${player}". Vérifie le pseudo ou l’ID de plateforme.` });
+      return res.status(404).json({ error: `Aucun replay trouvé pour "${player}". Vérifie le pseudo (exact) ou utilise steam:ID / epic:ID.` });
     }
 
-    // 2) Récupérer les détails de chaque replay (concurrence limitée à 4)
-    const replayIds = replayList.map(r => r.id);
-    const details = await pMapLimit(replayIds, 4, (id) => ballchasingFetch(`/replays/${id}`));
+    // 2) Récupérer les détails de chaque replay (2 en parallèle → respecte la limite gratuite)
+    const replayIds = replayList.map((r) => r.id);
+    const details = await pMapLimit(replayIds, 2, (id) => ballchasingFetch(`/replays/${id}`));
 
     // 3) Agréger
-    const stats = aggregateStats(details, player);
+    const stats = aggregateStats(details, query);
 
     if (stats.matches === 0) {
       return res.status(404).json({ error: `Le joueur "${player}" n’apparaît dans aucun des replays récupérés.` });
     }
 
     setCache(cacheKey, stats);
-    res.json({ demo: false, player, stats });
+    res.json({ demo: false, player: stats.displayName || player, stats });
   } catch (err) {
     console.error('Erreur /api/stats:', err.message);
     if (err.code === 'INVALID_KEY') return res.status(401).json({ error: 'Clé API Ballchasing invalide ou expirée.' });
     if (err.code === 'RATE_LIMIT') return res.status(429).json({ error: 'Quota Ballchasing dépassé. Réessaie dans quelques minutes.' });
-    if (err.code === 'NO_KEY') return res.status(500).json({ error: 'Clé API non configurée sur le serveur. Utilise le mode démo.' });
+    if (err.code === 'NO_KEY') return res.status(500).json({ error: 'Clé API non configurée sur le serveur (fichier .env). Utilise le mode démo en attendant.' });
     res.status(500).json({ error: 'Erreur interne lors de la récupération des statistiques.' });
   }
 });
